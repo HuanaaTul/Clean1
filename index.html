@@ -57,7 +57,6 @@
             messagingSenderId: "927139719075",
             appId: "1:927139719075:web:7c135cb30e84d358d49c16",
             measurementId: "G-C8SM5R4G3T"
-            
         };
 
         const isFirebaseConfigured = FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.apiKey !== "YOUR_API_KEY";
@@ -70,7 +69,6 @@
             }
             db = firebase.firestore();
             storage = firebase.storage();
-            storage.setMaxUploadRetryTime(8000); // ตัดการรอค้างไว้ที่ 8 วินาที
         }
 
         // =====================================================================
@@ -123,7 +121,7 @@
             { id: 'C6', x: 32.08, y: 22.17, w: 21.87, h: 10.70, lx: 34.00, ly: 25.0, assignee: 'นายปรัชญา แย้มวาจา' },
             { id: 'D1', x: 53.95, y: 22.17, w: 14.26, h: 10.70, lx: 60.80, ly: 24.8, assignee: 'นายวัฒนานนท์ หงษ์ทอง' },
             { id: 'D2', x: 76.07, y: 9.25, w: 6.55, h: 12.85, lx: 79.35, ly: 19.2, assignee: 'นายทนงศักดิ์ ใจฉ่ำ' },
-        ].map(z => ({ ...z, status: 'pending', photoCount: 0, updatedAt: null }));
+        ].map(z => ({ ...z, status: 'pending', photos: [], updatedAt: null }));
 
         const STATUS_CONFIG = {
             pending: { fill: 'rgba(156, 163, 175, 0.28)', stroke: '#9ca3af', badge: 'bg-gray-100 text-gray-700', label: 'ยังไม่ดำเนินการ' },
@@ -134,11 +132,13 @@
 
         const LOCAL_STORAGE_KEY = 'impp_cleaning_fallback_v4';
 
-        // บีบอัดภาพให้เหลือขนาด ~50-70 KB (800px) เพื่อความเร็วสูงสุดในการส่งผ่านเน็ตโรงงาน
-        const compressImage = (dataUrl, maxDimension = 800, quality = 0.6) => {
+        // ฟังก์ชันย่อรูปเป็น Binary Blob ทันที (ไม่ผ่าน Base64 ลดขนาดเหลือ ~60-90KB ต่อรูป)
+        const compressFileToBlob = (file, maxDimension = 800, quality = 0.6) => {
             return new Promise((resolve) => {
+                const objectUrl = URL.createObjectURL(file);
                 const img = new Image();
                 img.onload = () => {
+                    URL.revokeObjectURL(objectUrl);
                     let { width, height } = img;
                     if (width > maxDimension || height > maxDimension) {
                         if (width > height) {
@@ -154,41 +154,53 @@
                     canvas.height = height;
                     const ctx = canvas.getContext('2d');
                     ctx.drawImage(img, 0, 0, width, height);
-                    const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
                     canvas.toBlob((blob) => {
-                        resolve({ dataUrl: compressedDataUrl, blob });
+                        resolve({
+                            blob,
+                            previewUrl: URL.createObjectURL(blob),
+                            sizeKB: Math.round(blob.size / 1024)
+                        });
                     }, 'image/jpeg', quality);
                 };
-                img.src = dataUrl;
+                img.src = objectUrl;
             });
         };
 
-        // อัปโหลดไฟล์ Blob ขึ้น Firebase Storage พร้อมระบบตัดเวลาหาก Storage ค้าง
-        const uploadBlobWithTimeout = (fileRef, blob, timeoutMs = 8000) => {
-            return new Promise((resolve, reject) => {
-                const uploadTask = fileRef.put(blob, { contentType: 'image/jpeg' });
-                const timer = setTimeout(() => {
-                    try { uploadTask.cancel(); } catch (e) {}
-                    reject(new Error('STORAGE_TIMEOUT'));
-                }, timeoutMs);
-
-                uploadTask.on(
-                    'state_changed',
-                    null,
-                    (err) => {
-                        clearTimeout(timer);
-                        reject(err);
-                    },
-                    async () => {
-                        clearTimeout(timer);
-                        try {
-                            const url = await uploadTask.snapshot.ref.getDownloadURL();
-                            resolve(url);
-                        } catch (err) {
-                            reject(err);
-                        }
+        // ฟังก์ชันจับภาพจากกล้องเว็บแคมเป็น Binary Blob ทันที
+        const captureVideoToBlob = (video, maxDimension = 800, quality = 0.6) => {
+            return new Promise((resolve) => {
+                let width = video.videoWidth || 1280;
+                let height = video.videoHeight || 720;
+                if (width > maxDimension || height > maxDimension) {
+                    if (width > height) {
+                        height = Math.round((height * maxDimension) / width);
+                        width = maxDimension;
+                    } else {
+                        width = Math.round((width * maxDimension) / height);
+                        height = maxDimension;
                     }
-                );
+                }
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0, width, height);
+                canvas.toBlob((blob) => {
+                    resolve({
+                        blob,
+                        previewUrl: URL.createObjectURL(blob),
+                        sizeKB: Math.round(blob.size / 1024)
+                    });
+                }, 'image/jpeg', quality);
+            });
+        };
+
+        // แปลง Blob เป็น DataURL (ใช้เฉพาะกรณีทดสอบแบบออฟไลน์ที่ยังไม่ใส่ Firebase Config)
+        const blobToDataUrl = (blob) => {
+            return new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onload = (e) => resolve(e.target.result);
+                reader.readAsDataURL(blob);
             });
         };
 
@@ -197,26 +209,25 @@
             const [role, setRole] = useState('employee');
             
             const [zones, setZones] = useState(INITIAL_ZONES);
-            const [zonePhotosMap, setZonePhotosMap] = useState({}); // เก็บรูปภาพแยกตามโซน { A1: [...], D2: [...] }
             const [period, setPeriod] = useState({ start: '2026-11-01', end: '2026-11-30' });
             const [managerPin, setManagerPin] = useState('1234');
             
             const [isSyncing, setIsSyncing] = useState(isFirebaseConfigured);
             const [isUploading, setIsUploading] = useState(false);
-            const [uploadStatusText, setUploadStatusText] = useState('');
+            const [uploadProgress, setUploadProgress] = useState(0);
+            const [isCompressing, setIsCompressing] = useState(false);
 
-            // ซิงค์ข้อมูลสถานะโซนและรูปภาพแบบ Real-time
             useEffect(() => {
                 if (isFirebaseConfigured && db) {
-                    const cycleDocRef = db.collection('impp_cleaning').doc('current_cycle');
-                    const unsubCycle = cycleDocRef.onSnapshot((doc) => {
+                    const docRef = db.collection('impp_cleaning').doc('current_cycle');
+                    const unsubscribe = docRef.onSnapshot((doc) => {
                         if (doc.exists) {
                             const data = doc.data();
                             if (data.zones) setZones(data.zones);
                             if (data.period) setPeriod(data.period);
                             if (data.managerPin) setManagerPin(data.managerPin);
                         } else {
-                            cycleDocRef.set({
+                            docRef.set({
                                 zones: INITIAL_ZONES,
                                 period: { start: '2026-11-01', end: '2026-11-30' },
                                 managerPin: '1234'
@@ -227,27 +238,13 @@
                         console.error("Firestore error:", err);
                         setIsSyncing(false);
                     });
-
-                    // ซิงค์คอลเลกชันรูปภาพแยกตามโซน (รองรับได้ไม่จำกัดโซนโดยไม่ติดลิมิต 1MB ต่อเอกสาร)
-                    const unsubPhotos = cycleDocRef.collection('zone_photos').onSnapshot((snap) => {
-                        const map = {};
-                        snap.forEach((doc) => {
-                            map[doc.id] = doc.data().photos || [];
-                        });
-                        setZonePhotosMap(map);
-                    });
-
-                    return () => {
-                        unsubCycle();
-                        unsubPhotos();
-                    };
+                    return () => unsubscribe();
                 } else {
                     try {
                         const saved = localStorage.getItem(LOCAL_STORAGE_KEY);
                         if (saved) {
                             const parsed = JSON.parse(saved);
                             if (parsed.zones) setZones(parsed.zones);
-                            if (parsed.zonePhotosMap) setZonePhotosMap(parsed.zonePhotosMap);
                             if (parsed.period) setPeriod(parsed.period);
                             if (parsed.managerPin) setManagerPin(parsed.managerPin);
                         }
@@ -255,23 +252,25 @@
                 }
             }, []);
 
-            const persistSystemData = async (nextZones, nextPhotosMap = zonePhotosMap, nextPeriod = period, nextPin = managerPin) => {
+            const persistSystemData = async (nextZones, nextPeriod = period, nextPin = managerPin) => {
                 setZones(nextZones);
-                setZonePhotosMap(nextPhotosMap);
                 setPeriod(nextPeriod);
                 setManagerPin(nextPin);
 
                 if (isFirebaseConfigured && db) {
-                    await db.collection('impp_cleaning').doc('current_cycle').set({
-                        zones: nextZones,
-                        period: nextPeriod,
-                        managerPin: nextPin
-                    });
+                    try {
+                        await db.collection('impp_cleaning').doc('current_cycle').set({
+                            zones: nextZones,
+                            period: nextPeriod,
+                            managerPin: nextPin
+                        });
+                    } catch (err) {
+                        alert("เกิดข้อผิดพลาดในการบันทึกข้อมูลขึ้น Cloud: " + err.message);
+                    }
                 } else {
                     try {
                         localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({
                             zones: nextZones,
-                            zonePhotosMap: nextPhotosMap,
                             period: nextPeriod,
                             managerPin: nextPin
                         }));
@@ -290,7 +289,6 @@
                 }
             ];
 
-            // สถานะ Modal ต่างๆ
             const [isPinModalOpen, setIsPinModalOpen] = useState(false);
             const [pinInput, setPinInput] = useState('');
             const [pinError, setPinError] = useState('');
@@ -311,14 +309,13 @@
 
             const [isCameraOpen, setIsCameraOpen] = useState(false);
             const [cameraReady, setCameraReady] = useState(false);
-            const [tempPhotos, setTempPhotos] = useState([]); // เก็บ { dataUrl, blob }
+            // tempPhotos เก็บ { blob, previewUrl, sizeKB }
+            const [tempPhotos, setTempPhotos] = useState([]);
             const videoRef = useRef(null);
-            const canvasRef = useRef(null);
             const fileInputRef = useRef(null);
             const [stream, setStream] = useState(null);
 
             const activeZone = zones.find(z => z.id === activeZoneId) || null;
-            const activeZonePhotos = activeZoneId ? (zonePhotosMap[activeZoneId] || []) : [];
 
             const stats = {
                 total: zones.length,
@@ -328,9 +325,6 @@
                 rework: zones.filter(z => z.status === 'rework').length,
             };
 
-            // -------------------------------------------------------------
-            // ปลดล็อกสิทธิ์หัวหน้างาน
-            // -------------------------------------------------------------
             const openPinPrompt = () => {
                 setPinInput('');
                 setPinError('');
@@ -351,9 +345,6 @@
                 }
             };
 
-            // -------------------------------------------------------------
-            // จัดการตั้งค่า, ส่งออกรายงาน และล้างข้อมูลรอบใหม่
-            // -------------------------------------------------------------
             const openSettings = (defaultTab = 'report') => {
                 setTempAssignments(zones.map(z => ({ id: z.id, assignee: z.assignee })));
                 setTempPeriod({ ...period });
@@ -369,7 +360,7 @@
                     return updated ? { ...z, assignee: updated.assignee } : z;
                 });
                 const finalPin = tempNewPin.trim().length >= 4 ? tempNewPin.trim() : managerPin;
-                await persistSystemData(updatedZones, zonePhotosMap, { ...tempPeriod }, finalPin);
+                await persistSystemData(updatedZones, { ...tempPeriod }, finalPin);
                 setIsSettingsOpen(false);
             };
 
@@ -378,17 +369,15 @@
             };
 
             const downloadCSVReport = () => {
-                const headers = ['โซนพื้นที่', 'ผู้รับผิดชอบ', 'สถานะ', 'จำนวนรูปถ่าย', 'อัปเดตล่าสุด'];
-                const rows = zones.map(z => {
-                    const photos = zonePhotosMap[z.id] || [];
-                    return [
-                        z.id,
-                        `"${z.assignee || 'ยังไม่ระบุ'}"`,
-                        STATUS_CONFIG[z.status].label,
-                        photos.length,
-                        z.updatedAt ? `"${z.updatedAt}"` : '-'
-                    ];
-                });
+                const headers = ['โซนพื้นที่', 'ผู้รับผิดชอบ', 'สถานะ', 'จำนวนรูปถ่าย', 'ลิงก์รูปภาพ', 'อัปเดตล่าสุด'];
+                const rows = zones.map(z => [
+                    z.id,
+                    `"${z.assignee || 'ยังไม่ระบุ'}"`,
+                    STATUS_CONFIG[z.status].label,
+                    z.photos.length,
+                    `"${z.photos.join(' | ')}"`,
+                    z.updatedAt ? `"${z.updatedAt}"` : '-'
+                ]);
                 const csvContent = '\uFEFF' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
                 const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
                 const url = URL.createObjectURL(blob);
@@ -396,4 +385,1046 @@
                 a.href = url;
                 a.download = `IMPP_Cleaning_Summary_${period.start}_to_${period.end}.csv`;
                 a.click();
-                URL.revokeObject
+                URL.revokeObjectURL(url);
+            };
+
+            const downloadFullHTMLReport = () => {
+                const reportDate = new Date().toLocaleString('th-TH');
+                const html = `<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<title>รายงานผลการทำความสะอาดพื้นที่ IMPP (${period.start} ถึง ${period.end})</title>
+<style>
+  body { font-family: 'Sarabun', sans-serif; color: #1e293b; padding: 30px; max-width: 1000px; margin: auto; }
+  h1 { font-size: 22px; margin-bottom: 4px; color: #0f172a; }
+  .meta { font-size: 14px; color: #475569; margin-bottom: 20px; }
+  .summary { display: flex; gap: 12px; margin-bottom: 24px; }
+  .card { flex: 1; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px; text-align: center; }
+  .card strong { font-size: 20px; display: block; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 30px; font-size: 14px; }
+  th, td { border: 1px solid #cbd5e1; padding: 8px 10px; text-align: left; }
+  th { background: #f1f5f9; }
+  .badge { padding: 3px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+  .pass { background: #dcfce7; color: #166534; }
+  .review { background: #fef9c3; color: #854d0e; }
+  .rework { background: #fee2e2; color: #991b1b; }
+  .pending { background: #f1f5f9; color: #475569; }
+  .photo-section { page-break-inside: avoid; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 16px; }
+  .photo-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px; }
+  .photo-grid img { width: 100%; height: 180px; object-fit: cover; border-radius: 6px; border: 1px solid #cbd5e1; }
+  @media print { .no-print { display: none; } }
+</style>
+</head>
+<body>
+  <div class="no-print" style="background:#eff6ff;border:1px solid #bfdbfe;padding:12px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;">
+    <span>แนะนำให้กดปุ่ม <strong>"พิมพ์ / บันทึกเป็น PDF"</strong> เพื่อเก็บไฟล์รูปภาพไว้ในเครื่องแบบถาวรก่อนล้างข้อมูลบน Cloud</span>
+    <button onclick="window.print()" style="background:#2563eb;color:white;border:none;padding:8px 16px;border-radius:6px;font-weight:bold;cursor:pointer;">พิมพ์ / บันทึกเป็น PDF</button>
+  </div>
+  <h1>รายงานการตรวจสอบความสะอาดพื้นที่ (5S & Cleaning)</h1>
+  <div class="meta">
+    รอบการดำเนินงาน: <strong>${period.start} ถึง ${period.end}</strong> | วันที่ออกรายงาน: ${reportDate}
+  </div>
+  <div class="summary">
+    <div class="card"><span>ทั้งหมด</span><strong>${stats.total} โซน</strong></div>
+    <div class="card" style="background:#f0fdf4;"><span>ตรวจสอบผ่าน</span><strong style="color:#16a34a;">${stats.pass} โซน</strong></div>
+    <div class="card" style="background:#fefce8;"><span>รอตรวจสอบ</span><strong style="color:#ca8a04;">${stats.review} โซน</strong></div>
+    <div class="card" style="background:#fef2f2;"><span>ต้องแก้ไข</span><strong style="color:#dc2626;">${stats.rework} โซน</strong></div>
+    <div class="card"><span>ยังไม่ดำเนินการ</span><strong>${stats.pending} โซน</strong></div>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:80px;">โซน</th>
+        <th>ผู้รับผิดชอบ</th>
+        <th style="width:160px;">สถานะ</th>
+        <th style="width:100px;">รูปหลักฐาน</th>
+        <th style="width:160px;">เวลาอัปเดต</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${zones.map(z => `
+        <tr>
+          <td><strong>${z.id}</strong></td>
+          <td>${z.assignee || '-'}</td>
+          <td><span class="badge ${z.status}">${STATUS_CONFIG[z.status].label}</span></td>
+          <td>${z.photos.length} รูป</td>
+          <td>${z.updatedAt || '-'}</td>
+        </tr>
+      `).join('')}
+    </tbody>
+  </table>
+  <h2>ภาคผนวก: ภาพถ่ายหลักฐานแยกตามพื้นที่</h2>
+  ${zones.filter(z => z.photos.length > 0).length === 0 
+    ? '<p style="color:#64748b;">ยังไม่มีภาพถ่ายหลักฐานในรอบนี้</p>' 
+    : zones.filter(z => z.photos.length > 0).map(z => `
+      <div class="photo-section">
+        <strong>โซน ${z.id}</strong> — ผู้รับผิดชอบ: ${z.assignee || '-'} | สถานะ: ${STATUS_CONFIG[z.status].label} (${z.updatedAt || '-'})
+        <div class="photo-grid">
+          ${z.photos.map(p => `<img src="${p}" />`).join('')}
+        </div>
+      </div>
+    `).join('')}
+</body>
+</html>`;
+                const blob = new Blob([html], { type: 'text/html;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `IMPP_Cleaning_Full_Report_${period.start}_to_${period.end}.html`;
+                a.click();
+                URL.revokeObjectURL(url);
+            };
+
+            const handleResetCycle = async () => {
+                if (resetConfirmText !== 'RESET') return;
+                setIsResetting(true);
+
+                try {
+                    if (isFirebaseConfigured && storage) {
+                        const allPhotoUrls = zones.flatMap(z => z.photos || []);
+                        await Promise.all(
+                            allPhotoUrls.map(async (url) => {
+                                if (url.startsWith('http')) {
+                                    try {
+                                        await storage.refFromURL(url).delete();
+                                    } catch (err) {
+                                        console.warn("ข้ามการลบไฟล์ที่ไม่พบ:", err);
+                                    }
+                                }
+                            })
+                        );
+                    }
+
+                    const clearedZones = zones.map(z => ({
+                        ...z,
+                        status: 'pending',
+                        photos: [],
+                        updatedAt: null
+                    }));
+
+                    await persistSystemData(clearedZones);
+                    setActiveZoneId(null);
+                    setResetConfirmText('');
+                    setIsSettingsOpen(false);
+                    alert('ล้างข้อมูลและลบไฟล์รูปบน Cloud เรียบร้อยแล้ว พร้อมเริ่มรอบใหม่!');
+                } finally {
+                    setIsResetting(false);
+                }
+            };
+
+            // -------------------------------------------------------------
+            // ระบบกล้องและการอัปโหลดแบบ Binary Blob (ความเร็วสูง)
+            // -------------------------------------------------------------
+            const startCamera = async () => {
+                setIsCameraOpen(true);
+                setCameraReady(false);
+                setUploadProgress(0);
+                try {
+                    const mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                        video: { facingMode: 'environment' } 
+                    });
+                    setStream(mediaStream);
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = mediaStream;
+                        setCameraReady(true);
+                    }
+                } catch (err) {
+                    setCameraReady(false);
+                }
+            };
+
+            const takePhoto = async () => {
+                if (videoRef.current && cameraReady && !isCompressing) {
+                    setIsCompressing(true);
+                    try {
+                        const photoObj = await captureVideoToBlob(videoRef.current, 800, 0.6);
+                        setTempPhotos(prev => [...prev, photoObj]);
+                    } finally {
+                        setIsCompressing(false);
+                    }
+                }
+            };
+
+            const handleNativeCapture = async (e) => {
+                const files = Array.from(e.target.files);
+                if (files.length === 0) return;
+                setIsCompressing(true);
+                try {
+                    const compressedList = await Promise.all(
+                        files.map(file => compressFileToBlob(file, 800, 0.6))
+                    );
+                    setTempPhotos(prev => [...prev, ...compressedList]);
+                } finally {
+                    setIsCompressing(false);
+                    e.target.value = '';
+                }
+            };
+
+            const removeTempPhoto = (idx) => {
+                setTempPhotos(prev => {
+                    const target = prev[idx];
+                    if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
+                    return prev.filter((_, i) => i !== idx);
+                });
+            };
+
+            const closeCamera = () => {
+                if (stream) stream.getTracks().forEach(track => track.stop());
+                tempPhotos.forEach(p => { if (p.previewUrl) URL.revokeObjectURL(p.previewUrl); });
+                setStream(null);
+                setIsCameraOpen(false);
+                setTempPhotos([]);
+                setUploadProgress(0);
+            };
+
+            const submitWork = async () => {
+                if (tempPhotos.length === 0 || isUploading) return;
+                setIsUploading(true);
+                setUploadProgress(5);
+
+                try {
+                    let finalPhotoUrls = [];
+
+                    if (isFirebaseConfigured && storage) {
+                        const timestamp = Date.now();
+                        const totalBytes = tempPhotos.reduce((sum, item) => sum + item.blob.size, 0);
+                        const transferredMap = new Array(tempPhotos.length).fill(0);
+
+                        finalPhotoUrls = await Promise.all(
+                            tempPhotos.map((item, idx) => {
+                                return new Promise((resolve, reject) => {
+                                    const fileRef = storage.ref().child(`cleaning_photos/${activeZone.id}_${timestamp}_${idx}.jpg`);
+                                    // อัปโหลดเป็น Binary Blob โดยตรง (เร็วกว่า Base64 หลายเท่า)
+                                    const uploadTask = fileRef.put(item.blob, { contentType: 'image/jpeg' });
+
+                                    uploadTask.on(
+                                        'state_changed',
+                                        (snapshot) => {
+                                            transferredMap[idx] = snapshot.bytesTransferred;
+                                            const totalTransferred = transferredMap.reduce((a, b) => a + b, 0);
+                                            const pct = Math.min(98, Math.round((totalTransferred / totalBytes) * 100));
+                                            setUploadProgress(pct);
+                                        },
+                                        (error) => reject(error),
+                                        async () => {
+                                            const url = await uploadTask.snapshot.ref.getDownloadURL();
+                                            resolve(url);
+                                        }
+                                    );
+                                });
+                            })
+                        );
+                    } else {
+                        finalPhotoUrls = await Promise.all(tempPhotos.map(item => blobToDataUrl(item.blob)));
+                        setUploadProgress(100);
+                    }
+
+                    const now = new Date().toLocaleString('th-TH', { dateStyle: 'short', timeStyle: 'short' });
+                    const updatedZones = zones.map(z => 
+                        z.id === activeZone.id ? { ...z, status: 'review', photos: finalPhotoUrls, updatedAt: now } : z
+                    );
+
+                    await persistSystemData(updatedZones);
+                    setUploadProgress(100);
+                    closeCamera();
+                    setActiveZoneId(null);
+                } catch (err) {
+                    alert("อัปโหลดรูปภาพไม่สำเร็จ: " + err.message);
+                } finally {
+                    setIsUploading(false);
+                }
+            };
+
+            const updateZoneStatus = async (status) => {
+                const now = new Date().toLocaleString('th-TH', { dateStyle: 'short', timeStyle: 'short' });
+                const updatedZones = zones.map(z => 
+                    z.id === activeZone.id ? { ...z, status, updatedAt: now } : z
+                );
+                await persistSystemData(updatedZones);
+                setActiveZoneId(null);
+            };
+
+            // -------------------------------------------------------------
+            // หน้า Home
+            // -------------------------------------------------------------
+            if (view === 'home') {
+                const isSingleModule = PORTAL_MODULES.length === 1;
+
+                return (
+                    <div className="min-h-screen bg-gradient-to-br from-slate-100 via-blue-50/60 to-slate-200 flex flex-col justify-between p-4 sm:p-8 relative">
+                        <div className={`${isSingleModule ? 'max-w-lg' : 'max-w-4xl'} w-full mx-auto my-auto animate-fade-in`}>
+                            <div className="text-center mb-8">
+                                <div className="inline-flex items-center gap-2 px-3.5 py-1 bg-white/90 border border-gray-200 rounded-full text-xs font-semibold text-gray-600 shadow-sm mb-3">
+                                    <i className="fas fa-industry text-blue-600"></i> โรงชุบกระดาษและผลิตกาว (IMPP)
+                                </div>
+                                <h1 className="text-2xl sm:text-3xl font-bold text-gray-800">
+                                    ระบบปฏิบัติการภายในโรงงาน
+                                </h1>
+                                <p className="text-sm text-gray-500 mt-1.5">
+                                    เลือกเมนูงานที่ต้องการดำเนินการ
+                                </p>
+                            </div>
+
+                            <div className={isSingleModule ? 'grid grid-cols-1' : 'grid grid-cols-1 sm:grid-cols-2 gap-5'}>
+                                {PORTAL_MODULES.map((mod) => (
+                                    <button 
+                                        key={mod.id}
+                                        onClick={mod.onClick}
+                                        className="group bg-white hover:bg-blue-600 text-left p-6 sm:p-7 rounded-3xl shadow-md hover:shadow-xl border border-gray-200/80 hover:border-blue-600 transition-all duration-200 flex flex-col justify-between"
+                                    >
+                                        <div>
+                                            <div className="flex justify-between items-start mb-5">
+                                                <div className="w-14 h-14 rounded-2xl bg-blue-100 group-hover:bg-white/20 text-blue-600 group-hover:text-white flex items-center justify-center text-2xl transition">
+                                                    <i className={`fas ${mod.icon}`}></i>
+                                                </div>
+                                                <span className="px-3 py-1 rounded-full text-xs font-bold bg-green-100 text-green-700 group-hover:bg-white group-hover:text-blue-700">
+                                                    พร้อมใช้งาน
+                                                </span>
+                                            </div>
+                                            <h2 className="text-xl font-bold text-gray-800 group-hover:text-white mb-1.5">
+                                                {mod.title}
+                                            </h2>
+                                            <p className="text-xs sm:text-sm text-gray-500 group-hover:text-blue-100 leading-relaxed">
+                                                {mod.description}
+                                            </p>
+                                        </div>
+                                        <div className="mt-6 pt-4 border-t border-gray-100 group-hover:border-blue-500 flex justify-between items-center text-xs sm:text-sm">
+                                            <span className="text-gray-500 group-hover:text-blue-100">
+                                                <i className="fas fa-calendar-alt mr-1.5"></i>
+                                                {mod.footerText}
+                                            </span>
+                                            <span className="font-bold text-blue-600 group-hover:text-white flex items-center gap-1.5">
+                                                เข้าใช้งาน <i className="fas fa-arrow-right"></i>
+                                            </span>
+                                        </div>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="text-center text-xs text-gray-400 mt-8 flex items-center justify-center gap-2">
+                            <span>IMPP Facility Management System</span>
+                            <span>•</span>
+                            {isFirebaseConfigured ? (
+                                <span className="text-emerald-600 font-medium"><i className="fas fa-cloud mr-1"></i> เชื่อมต่อ Cloud ออนไลน์</span>
+                            ) : (
+                                <span className="text-amber-600 font-medium"><i className="fas fa-desktop mr-1"></i> โหมดทดสอบในเครื่อง (รอใส่ค่า Firebase)</span>
+                            )}
+                        </div>
+
+                        <button 
+                            onClick={openPinPrompt}
+                            title="เข้าสู่สิทธิ์หัวหน้างาน"
+                            className="fixed bottom-4 right-4 w-10 h-10 rounded-full bg-white/70 hover:bg-white text-gray-400 hover:text-purple-600 shadow-sm border border-gray-200 flex items-center justify-center transition-all opacity-50 hover:opacity-100"
+                        >
+                            <i className="fas fa-user-shield text-sm"></i>
+                        </button>
+
+                        {isPinModalOpen && (
+                            <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                                <form onSubmit={verifyPin} className="bg-white rounded-2xl w-full max-w-xs p-6 shadow-2xl animate-fade-in">
+                                    <div className="flex justify-between items-center mb-4">
+                                        <h3 className="font-bold text-gray-800 flex items-center gap-2">
+                                            <i className="fas fa-lock text-purple-600"></i> สิทธิ์หัวหน้างาน
+                                        </h3>
+                                        <button type="button" onClick={() => setIsPinModalOpen(false)} className="text-gray-400 hover:text-gray-600">
+                                            <i className="fas fa-times"></i>
+                                        </button>
+                                    </div>
+                                    <p className="text-xs text-gray-500 mb-3">กรอกรหัสผ่านเพื่อเข้าสู่โหมดตรวจสอบ ดาวน์โหลดรายงาน และตั้งค่าระบบ</p>
+                                    <input 
+                                        type="password" 
+                                        autoFocus
+                                        value={pinInput}
+                                        onChange={(e) => setPinInput(e.target.value)}
+                                        placeholder="กรอกรหัสผ่าน..."
+                                        className="w-full border border-gray-300 focus:border-purple-500 focus:ring-2 focus:ring-purple-200 rounded-xl px-4 py-2.5 text-center text-lg tracking-widest outline-none mb-2"
+                                    />
+                                    {pinError && <p className="text-xs text-red-500 text-center mb-2">{pinError}</p>}
+                                    <button type="submit" className="w-full py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-sm mt-2 transition">
+                                        ยืนยันรหัสผ่าน
+                                    </button>
+                                </form>
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            // -------------------------------------------------------------
+            // หน้าจอแผนผังทำความสะอาด
+            // -------------------------------------------------------------
+            return (
+                <div className="min-h-screen flex flex-col overflow-hidden bg-slate-100">
+                    <header className="bg-white border-b border-gray-200 px-3 sm:px-5 py-2.5 flex justify-between items-center z-20 shadow-sm">
+                        <div className="flex items-center gap-2.5 sm:gap-3">
+                            <button 
+                                onClick={() => { setView('home'); setActiveZoneId(null); }} 
+                                title="กลับหน้าหลัก"
+                                className="p-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl transition"
+                            >
+                                <i className="fas fa-home"></i>
+                            </button>
+                            <button 
+                                onClick={() => setIsMenuOpen(true)} 
+                                className="px-3 py-2 bg-gray-100 hover:bg-gray-200 rounded-xl text-xs sm:text-sm font-semibold flex items-center gap-2 relative transition"
+                            >
+                                <i className="fas fa-list-ul text-gray-600"></i>
+                                <span className="hidden sm:inline">รายการโซน</span>
+                                {((role === 'manager' && stats.review > 0) || (role === 'employee' && stats.rework > 0)) && (
+                                    <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse"></span>
+                                )}
+                            </button>
+                            <div>
+                                <div className="flex items-center gap-2">
+                                    <span className="font-bold text-gray-800 text-sm sm:text-base">ผังพื้นที่ทำความสะอาด</span>
+                                    {role === 'manager' && (
+                                        <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-[11px] font-bold rounded-md">
+                                            หัวหน้างาน
+                                        </span>
+                                    )}
+                                    {isSyncing && (
+                                        <span className="text-[11px] text-blue-600 animate-pulse">
+                                            <i className="fas fa-sync fa-spin mr-1"></i>กำลังซิงค์...
+                                        </span>
+                                    )}
+                                </div>
+                                <p className="text-[11px] text-gray-500">
+                                    <i className="fas fa-clock mr-1"></i>
+                                    กำหนดส่ง: {new Date(period.start).toLocaleDateString('th-TH')} - {new Date(period.end).toLocaleDateString('th-TH')}
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                            {role === 'manager' ? (
+                                <>
+                                    <button 
+                                        onClick={() => openSettings('report')} 
+                                        className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs sm:text-sm font-semibold flex items-center gap-1.5 shadow-sm transition"
+                                        title="ดาวน์โหลดรายงานลงคอมพิวเตอร์"
+                                    >
+                                        <i className="fas fa-file-download"></i>
+                                        <span className="hidden md:inline">รายงาน</span>
+                                    </button>
+                                    <button 
+                                        onClick={() => openSettings('schedule')} 
+                                        className="px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-xl text-xs sm:text-sm font-semibold flex items-center gap-1.5 shadow-sm transition"
+                                    >
+                                        <i className="fas fa-sliders-h"></i>
+                                        <span className="hidden sm:inline">ตั้งค่า & ล้างรอบ</span>
+                                    </button>
+                                    <button 
+                                        onClick={() => { setRole('employee'); setActiveZoneId(null); }} 
+                                        title="ล็อกกลับเป็นโหมดพนักงาน"
+                                        className="p-2 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-xl transition"
+                                    >
+                                        <i className="fas fa-lock"></i>
+                                    </button>
+                                </>
+                            ) : (
+                                <button 
+                                    onClick={openPinPrompt}
+                                    title="เข้าสู่สิทธิ์หัวหน้างาน"
+                                    className="p-2 text-gray-300 hover:text-purple-600 rounded-xl transition"
+                                >
+                                    <i className="fas fa-user-shield"></i>
+                                </button>
+                            )}
+                        </div>
+                    </header>
+
+                    {/* แถบสีสถานะ */}
+                    <div className="bg-white/90 border-b border-gray-200/70 px-4 py-1.5 flex flex-wrap justify-center gap-3 sm:gap-6 text-xs text-gray-600">
+                        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm bg-gray-300 border border-gray-400 inline-block"></span> ยังไม่ทำ ({stats.pending})</span>
+                        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm bg-yellow-400/70 border border-yellow-500 inline-block"></span> รอตรวจ ({stats.review})</span>
+                        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm bg-green-500/60 border border-green-600 inline-block"></span> สำเร็จ ({stats.pass})</span>
+                        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm bg-red-500/60 border border-red-600 inline-block"></span> แก้ไข ({stats.rework})</span>
+                    </div>
+
+                    {/* แผนผังหลัก */}
+                    <div className="flex-1 relative flex items-center justify-center p-2 sm:p-4 overflow-auto">
+                        <div className="relative shadow-xl bg-white w-full max-w-[1160px] rounded-xl overflow-hidden border border-gray-300">
+                            {!imageError ? (
+                                <img 
+                                    src="./IMPP_4.jpg" 
+                                    alt="แผนผังพื้นที่โรงงาน" 
+                                    className="w-full h-auto block pointer-events-none" 
+                                    onError={() => setImageError(true)} 
+                                />
+                            ) : (
+                                <div className="w-full aspect-[1024/724] bg-slate-100 flex items-center justify-center bg-[linear-gradient(to_right,#80808015_1px,transparent_1px),linear-gradient(to_bottom,#80808015_1px,transparent_1px)] bg-[size:24px_24px]">
+                                    <div className="bg-white/95 px-6 py-4 rounded-xl shadow-sm text-center border border-gray-200">
+                                        <p className="text-red-500 font-bold text-sm mb-1"><i className="fas fa-image mr-1"></i> ไม่พบไฟล์ภาพ IMPP_4.jpg</p>
+                                        <p className="text-gray-600 text-xs">กรุณานำไฟล์รูป <b>IMPP_4.jpg</b> มาวางไว้ในโฟลเดอร์เดียวกับไฟล์ HTML นี้</p>
+                                    </div>
+                                </div>
+                            )}
+
+                            <svg 
+                                viewBox="0 0 100 100" 
+                                preserveAspectRatio="none" 
+                                className="absolute inset-0 w-full h-full"
+                            >
+                                {zones.map((zone) => {
+                                    const cfg = STATUS_CONFIG[zone.status];
+                                    const isSelected = activeZoneId === zone.id;
+                                    const isHovered = hoveredZoneId === zone.id;
+                                    const commonProps = {
+                                        fill: cfg.fill,
+                                        stroke: isSelected ? '#2563eb' : cfg.stroke,
+                                        strokeWidth: isSelected ? '0.45' : (isHovered ? '0.35' : '0.18'),
+                                        vectorEffect: 'non-scaling-stroke',
+                                        className: 'cursor-pointer transition-opacity duration-150',
+                                        style: { opacity: isHovered || isSelected ? 0.95 : 0.85 },
+                                        onClick: () => setActiveZoneId(zone.id),
+                                        onMouseEnter: () => setHoveredZoneId(zone.id),
+                                        onMouseLeave: () => setHoveredZoneId(null),
+                                    };
+
+                                    if (zone.polygon) {
+                                        return <polygon key={zone.id} points={zone.polygon} {...commonProps} />;
+                                    }
+                                    return (
+                                        <rect 
+                                            key={zone.id} 
+                                            x={zone.x} 
+                                            y={zone.y} 
+                                            width={zone.w} 
+                                            height={zone.h} 
+                                            {...commonProps} 
+                                        />
+                                    );
+                                })}
+                            </svg>
+
+                            {zones.map((zone) => (
+                                <div
+                                    key={`label-${zone.id}`}
+                                    style={{ left: `${zone.lx}%`, top: `${zone.ly}%` }}
+                                    className="absolute -translate-x-1/2 -translate-y-1/2 pointer-events-none flex items-center justify-center"
+                                >
+                                    <span className={`text-[9px] sm:text-[11px] font-extrabold px-1 py-0.5 rounded shadow-sm border ${
+                                        activeZoneId === zone.id 
+                                            ? 'bg-blue-600 text-white border-blue-700' 
+                                            : 'bg-white/90 text-gray-900 border-gray-300/80'
+                                    }`}>
+                                        {zone.id}
+                                    </span>
+                                    {zone.status === 'review' && role === 'manager' && (
+                                        <span className="ml-0.5 w-3.5 h-3.5 bg-yellow-500 text-white text-[9px] font-bold rounded-full flex items-center justify-center shadow animate-bounce">
+                                            !
+                                        </span>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* ลิ้นชักรายการโซนด้านซ้าย */}
+                    {isMenuOpen && (
+                        <div className="fixed inset-0 bg-black/40 z-40 flex">
+                            <div className="w-80 bg-white h-full shadow-2xl flex flex-col animate-fade-in-right">
+                                <div className="p-4 border-b flex justify-between items-center bg-gray-50">
+                                    <h2 className="font-bold text-gray-800">รายการพื้นที่ทั้งหมด ({zones.length})</h2>
+                                    <button onClick={() => setIsMenuOpen(false)} className="w-8 h-8 rounded-lg hover:bg-gray-200 flex items-center justify-center">
+                                        <i className="fas fa-times"></i>
+                                    </button>
+                                </div>
+                                <div className="p-3 flex-1 overflow-y-auto space-y-2">
+                                    {zones.map(z => (
+                                        <button 
+                                            key={z.id} 
+                                            onClick={() => { setActiveZoneId(z.id); setIsMenuOpen(false); }} 
+                                            className="w-full text-left p-2.5 rounded-xl border border-gray-200 hover:bg-blue-50/50 flex justify-between items-center transition"
+                                        >
+                                            <div className="min-w-0 pr-2">
+                                                <div className="font-bold text-sm text-gray-800">โซน {z.id}</div>
+                                                <div className="text-xs text-gray-500 truncate">{z.assignee || 'ยังไม่ระบุผู้รับผิดชอบ'}</div>
+                                            </div>
+                                            <span className={`px-2 py-0.5 rounded-md text-[11px] font-semibold shrink-0 ${STATUS_CONFIG[z.status].badge}`}>
+                                                {STATUS_CONFIG[z.status].label}
+                                            </span>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                            <div className="flex-1" onClick={() => setIsMenuOpen(false)}></div>
+                        </div>
+                    )}
+
+                    {/* แถบรายละเอียดโซนด้านขวา */}
+                    {activeZone && !isCameraOpen && (
+                        <div className="fixed inset-y-0 right-0 w-full sm:w-96 bg-white shadow-2xl z-30 flex flex-col animate-fade-in-left border-l border-gray-200">
+                            <div className="p-4 border-b flex justify-between items-center bg-gray-50">
+                                <div>
+                                    <div className="flex items-center gap-2">
+                                        <h2 className="font-bold text-xl text-gray-800">พื้นที่โซน {activeZone.id}</h2>
+                                        <span className={`px-2.5 py-0.5 rounded-full text-xs font-semibold ${STATUS_CONFIG[activeZone.status].badge}`}>
+                                            {STATUS_CONFIG[activeZone.status].label}
+                                        </span>
+                                    </div>
+                                    {activeZone.updatedAt && (
+                                        <p className="text-[11px] text-gray-400 mt-0.5">อัปเดตล่าสุด: {activeZone.updatedAt}</p>
+                                    )}
+                                </div>
+                                <button onClick={() => setActiveZoneId(null)} className="w-8 h-8 hover:bg-gray-200 rounded-full flex items-center justify-center transition">
+                                    <i className="fas fa-times"></i>
+                                </button>
+                            </div>
+                            
+                            <div className="p-5 flex-1 overflow-y-auto space-y-5">
+                                <div>
+                                    <label className="text-xs font-bold text-gray-400 uppercase block mb-1.5">ผู้รับผิดชอบ</label>
+                                    <div className="flex items-center gap-3 bg-slate-50 p-3 rounded-xl border border-gray-200">
+                                        <div className="w-9 h-9 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center shrink-0">
+                                            <i className="fas fa-user"></i>
+                                        </div>
+                                        <span className="font-semibold text-sm text-gray-800">
+                                            {activeZone.assignee || <span className="text-gray-400 font-normal">ยังไม่ระบุชื่อผู้รับผิดชอบ</span>}
+                                        </span>
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="text-xs font-bold text-gray-400 uppercase block mb-1.5">กำหนดระยะเวลาดำเนินงาน</label>
+                                    <div className="text-sm bg-slate-50 px-3 py-2.5 rounded-xl border border-gray-200 text-gray-700 flex items-center gap-2">
+                                        <i className="fas fa-calendar-alt text-blue-500"></i>
+                                        <span>{new Date(period.start).toLocaleDateString('th-TH')} ถึง {new Date(period.end).toLocaleDateString('th-TH')}</span>
+                                    </div>
+                                </div>
+
+                                {activeZone.photos.length > 0 && (
+                                    <div>
+                                        <label className="text-xs font-bold text-gray-400 uppercase block mb-1.5">
+                                            รูปถ่ายหลักฐาน ({activeZone.photos.length} รูป)
+                                        </label>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            {activeZone.photos.map((p, i) => (
+                                                <img 
+                                                    key={i} 
+                                                    src={p} 
+                                                    onClick={() => setPreviewImage(p)}
+                                                    className="w-full h-28 object-cover rounded-xl border border-gray-200 cursor-zoom-in hover:opacity-90 transition" 
+                                                />
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div>
+                                    <label className="text-xs font-bold text-gray-400 uppercase block mb-1.5">รายการตรวจความสะอาด (5S)</label>
+                                    <div className="space-y-2.5 bg-slate-50 p-3.5 rounded-xl border border-gray-200 text-sm text-gray-700">
+                                        <label className="flex items-center gap-2.5 cursor-pointer">
+                                            <input type="checkbox" className="rounded text-blue-600" defaultChecked={activeZone.status !== 'pending'} />
+                                            <span>ปัดกวาดฝุ่นละอองและเศษขยะ</span>
+                                        </label>
+                                        <label className="flex items-center gap-2.5 cursor-pointer">
+                                            <input type="checkbox" className="rounded text-blue-600" defaultChecked={activeZone.status !== 'pending'} />
+                                            <span>เช็ดถูพื้นและขจัดคราบสกปรก</span>
+                                        </label>
+                                        <label className="flex items-center gap-2.5 cursor-pointer">
+                                            <input type="checkbox" className="rounded text-blue-600" defaultChecked={activeZone.status !== 'pending'} />
+                                            <span>จัดเก็บอุปกรณ์เข้าที่เรียบร้อย</span>
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="p-4 border-t bg-gray-50">
+                                {role === 'employee' && (
+                                    <>
+                                        {(activeZone.status === 'pending' || activeZone.status === 'rework') ? (
+                                            <button 
+                                                onClick={startCamera} 
+                                                className="w-full py-3.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold flex justify-center items-center gap-2 shadow-md transition"
+                                            >
+                                                <i className="fas fa-camera"></i> ถ่ายรูปส่งงานทำความสะอาด
+                                            </button>
+                                        ) : (
+                                            <div className="text-center text-xs text-gray-500 py-2">
+                                                พื้นที่นี้ส่งงานเรียบร้อยแล้ว
+                                            </div>
+                                        )}
+                                    </>
+                                )}
+
+                                {role === 'manager' && (
+                                    <div className="space-y-2">
+                                        {activeZone.status === 'review' ? (
+                                            <div className="grid grid-cols-2 gap-2.5">
+                                                <button 
+                                                    onClick={() => updateZoneStatus('rework')} 
+                                                    className="py-3 bg-red-100 hover:bg-red-200 text-red-700 rounded-xl font-bold text-sm flex justify-center items-center gap-1.5 transition"
+                                                >
+                                                    <i className="fas fa-undo"></i> ส่งกลับแก้ไข
+                                                </button>
+                                                <button 
+                                                    onClick={() => updateZoneStatus('pass')} 
+                                                    className="py-3 bg-green-600 hover:bg-green-700 text-white rounded-xl font-bold text-sm flex justify-center items-center gap-1.5 shadow-sm transition"
+                                                >
+                                                    <i className="fas fa-check"></i> ยืนยันผ่าน
+                                                </button>
+                                            </div>
+                                        ) : (
+                                            <button 
+                                                onClick={() => updateZoneStatus('pending')} 
+                                                className="w-full py-2.5 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-xl font-semibold text-xs transition"
+                                            >
+                                                รีเซ็ตสถานะเฉพาะโซนนี้
+                                            </button>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Modal ปลดล็อกรหัสผ่านหัวหน้างาน */}
+                    {isPinModalOpen && (
+                        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                            <form onSubmit={verifyPin} className="bg-white rounded-2xl w-full max-w-xs p-6 shadow-2xl animate-fade-in">
+                                <div className="flex justify-between items-center mb-4">
+                                    <h3 className="font-bold text-gray-800 flex items-center gap-2">
+                                        <i className="fas fa-lock text-purple-600"></i> สิทธิ์หัวหน้างาน
+                                    </h3>
+                                    <button type="button" onClick={() => setIsPinModalOpen(false)} className="text-gray-400 hover:text-gray-600">
+                                        <i className="fas fa-times"></i>
+                                    </button>
+                                </div>
+                                <p className="text-xs text-gray-500 mb-3">กรอกรหัสผ่านเพื่อเข้าสู่โหมดตรวจสอบและตั้งค่าระบบ</p>
+                                <input 
+                                    type="password" 
+                                    autoFocus
+                                    value={pinInput}
+                                    onChange={(e) => setPinInput(e.target.value)}
+                                    placeholder="กรอกรหัสผ่าน..."
+                                    className="w-full border border-gray-300 focus:border-purple-500 focus:ring-2 focus:ring-purple-200 rounded-xl px-4 py-2.5 text-center text-lg tracking-widest outline-none mb-2"
+                                />
+                                {pinError && <p className="text-xs text-red-500 text-center mb-2">{pinError}</p>}
+                                <button type="submit" className="w-full py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-sm mt-2 transition">
+                                    ยืนยันรหัสผ่าน
+                                </button>
+                            </form>
+                        </div>
+                    )}
+
+                    {/* Modal ตั้งค่า / ดาวน์โหลดรายงาน / ล้างข้อมูล */}
+                    {isSettingsOpen && role === 'manager' && (
+                        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+                            <div className="bg-white rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden animate-fade-in">
+                                <div className="p-4 sm:p-5 bg-purple-700 text-white flex justify-between items-center">
+                                    <h2 className="font-bold text-base sm:text-lg flex items-center gap-2">
+                                        <i className="fas fa-user-shield"></i> ศูนย์จัดการสำหรับหัวหน้างาน
+                                    </h2>
+                                    <button onClick={() => setIsSettingsOpen(false)} className="w-8 h-8 rounded-lg hover:bg-purple-600 flex items-center justify-center">
+                                        <i className="fas fa-times"></i>
+                                    </button>
+                                </div>
+
+                                <div className="flex border-b bg-gray-50 px-4 pt-2 gap-2">
+                                    <button 
+                                        onClick={() => setSettingsTab('report')}
+                                        className={`px-4 py-2.5 text-xs sm:text-sm font-bold rounded-t-xl border-t border-x transition ${settingsTab === 'report' ? 'bg-white text-emerald-700 border-gray-200' : 'text-gray-500 border-transparent hover:text-gray-700'}`}
+                                    >
+                                        <i className="fas fa-file-download mr-1.5"></i> ดาวน์โหลดรายงาน
+                                    </button>
+                                    <button 
+                                        onClick={() => setSettingsTab('schedule')}
+                                        className={`px-4 py-2.5 text-xs sm:text-sm font-bold rounded-t-xl border-t border-x transition ${settingsTab === 'schedule' ? 'bg-white text-purple-700 border-gray-200' : 'text-gray-500 border-transparent hover:text-gray-700'}`}
+                                    >
+                                        <i className="fas fa-users-cog mr-1.5"></i> รอบตรวจ & รายชื่อ
+                                    </button>
+                                    <button 
+                                        onClick={() => setSettingsTab('reset')}
+                                        className={`px-4 py-2.5 text-xs sm:text-sm font-bold rounded-t-xl border-t border-x transition ${settingsTab === 'reset' ? 'bg-white text-red-600 border-gray-200' : 'text-gray-500 border-transparent hover:text-gray-700'}`}
+                                    >
+                                        <i className="fas fa-broom mr-1.5"></i> ล้างข้อมูลเริ่มรอบใหม่
+                                    </button>
+                                </div>
+                                
+                                <div className="p-5 flex-1 overflow-y-auto bg-slate-50">
+                                    {settingsTab === 'report' && (
+                                        <div className="space-y-4">
+                                            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 text-sm text-emerald-900">
+                                                <strong><i className="fas fa-info-circle mr-1"></i> การสำรองข้อมูลลงคอมพิวเตอร์:</strong> สามารถกดดาวน์โหลดรายงานเก็บไว้ในเครื่องได้ตลอดเวลา เพื่อลดภาระพื้นที่เก็บข้อมูลบน Cloud/Firebase ก่อนกดล้างข้อมูลเริ่มรอบใหม่
+                                            </div>
+
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm flex flex-col justify-between">
+                                                    <div>
+                                                        <div className="w-12 h-12 rounded-xl bg-blue-100 text-blue-600 flex items-center justify-center text-xl mb-3">
+                                                            <i className="fas fa-file-pdf"></i>
+                                                        </div>
+                                                        <h3 className="font-bold text-gray-800 mb-1">รายงานฉบับสมบูรณ์พร้อมรูปถ่าย</h3>
+                                                        <p className="text-xs text-gray-500 leading-relaxed mb-4">
+                                                            ดาวน์โหลดเป็นไฟล์รายงาน HTML ที่มีตารางสรุปผลและ <strong>รูปถ่ายหน้างานทั้งหมด</strong> สามารถเปิดดูและกดสั่งพิมพ์เป็น PDF เก็บเข้าแฟ้มได้ทันที
+                                                        </p>
+                                                    </div>
+                                                    <button 
+                                                        onClick={downloadFullHTMLReport}
+                                                        className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition"
+                                                    >
+                                                        <i className="fas fa-download"></i> ดาวน์โหลดรายงาน + รูปภาพ
+                                                    </button>
+                                                </div>
+
+                                                <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm flex flex-col justify-between">
+                                                    <div>
+                                                        <div className="w-12 h-12 rounded-xl bg-emerald-100 text-emerald-600 flex items-center justify-center text-xl mb-3">
+                                                            <i className="fas fa-file-excel"></i>
+                                                        </div>
+                                                        <h3 className="font-bold text-gray-800 mb-1">ตารางสรุปผล (ไฟล์ Excel / CSV)</h3>
+                                                        <p className="text-xs text-gray-500 leading-relaxed mb-4">
+                                                            ดาวน์โหลดเฉพาะข้อมูลสรุป (รหัสโซน, ชื่อผู้รับผิดชอบ, สถานะ, จำนวนรูป, เวลาส่งงาน) เปิดในโปรแกรม Microsoft Excel เพื่อทำสถิติได้ทันที
+                                                        </p>
+                                                    </div>
+                                                    <button 
+                                                        onClick={downloadCSVReport}
+                                                        className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition"
+                                                    >
+                                                        <i className="fas fa-file-csv"></i> ดาวน์โหลดตาราง Excel (.csv)
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {settingsTab === 'schedule' && (
+                                        <div className="space-y-5">
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-white p-4 rounded-xl border border-gray-200">
+                                                <div>
+                                                    <label className="block text-xs font-bold text-gray-500 mb-1">วันที่เริ่มรอบงาน</label>
+                                                    <input type="date" value={tempPeriod.start} onChange={e => setTempPeriod({...tempPeriod, start: e.target.value})} className="w-full border border-gray-300 rounded-lg p-2 text-sm" />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-xs font-bold text-gray-500 mb-1">วันสิ้นสุด (Deadline)</label>
+                                                    <input type="date" value={tempPeriod.end} onChange={e => setTempPeriod({...tempPeriod, end: e.target.value})} className="w-full border border-gray-300 rounded-lg p-2 text-sm" />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-xs font-bold text-gray-500 mb-1">รหัสผ่านหัวหน้างาน (PIN)</label>
+                                                    <input type="text" value={tempNewPin} onChange={e => setTempNewPin(e.target.value)} placeholder="อย่างน้อย 4 ตัว" className="w-full border border-gray-300 rounded-lg p-2 text-sm" />
+                                                </div>
+                                            </div>
+
+                                            <div className="bg-white p-4 rounded-xl border border-gray-200">
+                                                <h3 className="font-bold text-sm text-gray-800 mb-3 flex items-center gap-2">
+                                                    <i className="fas fa-users text-purple-600"></i> กำหนดรายชื่อผู้รับผิดชอบแต่ละโซน
+                                                </h3>
+                                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                                                    {tempAssignments.map(zone => (
+                                                        <div key={zone.id} className="flex items-center gap-2 bg-slate-50 p-2 rounded-lg border border-gray-200">
+                                                            <span className="w-10 font-bold text-purple-700 bg-purple-100 text-center py-1 rounded text-xs shrink-0">
+                                                                {zone.id}
+                                                            </span>
+                                                            <input 
+                                                                type="text" 
+                                                                value={zone.assignee} 
+                                                                onChange={(e) => handleAssignmentChange(zone.id, e.target.value)} 
+                                                                placeholder="ระบุชื่อพนักงาน..." 
+                                                                className="flex-1 bg-white border border-gray-300 rounded px-2.5 py-1 text-xs outline-none focus:border-purple-500" 
+                                                            />
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {settingsTab === 'reset' && (
+                                        <div className="bg-white p-6 rounded-xl border border-red-200 max-w-xl mx-auto">
+                                            <div className="flex items-center gap-3 text-red-600 mb-3">
+                                                <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center shrink-0">
+                                                    <i className="fas fa-exclamation-triangle"></i>
+                                                </div>
+                                                <div>
+                                                    <h3 className="font-bold text-base">ล้างข้อมูลรูปภาพและสถานะเพื่อเริ่มรอบใหม่</h3>
+                                                    <p className="text-xs text-gray-500">ใช้เมื่อจบรอบการตรวจและดาวน์โหลดรายงานเก็บลงเครื่องเรียบร้อยแล้ว</p>
+                                                </div>
+                                            </div>
+
+                                            <ul className="text-xs text-gray-600 space-y-1.5 bg-red-50/60 p-4 rounded-xl border border-red-100 mb-4 list-disc pl-5">
+                                                <li>ระบบจะลบ <strong>ไฟล์รูปถ่ายหลักฐานทั้งหมด</strong> ออกจากพื้นที่เก็บข้อมูล Cloud (Firebase Storage)</li>
+                                                <li>สถานะของทุกโซน (A1–D2) จะถูกรีเซ็ตกลับเป็น <strong>"ยังไม่ดำเนินการ" (สีเทา)</strong></li>
+                                                <li><strong>รายชื่อผู้รับผิดชอบ</strong> ของแต่ละโซนจะยังคงอยู่เหมือนเดิม (ไม่ต้องกรอกใหม่)</li>
+                                            </ul>
+
+                                            <div className="mb-4">
+                                                <label className="block text-xs font-bold text-gray-700 mb-1.5">
+                                                    พิมพ์คำว่า <span className="text-red-600 font-mono">RESET</span> เพื่อยืนยันการล้างข้อมูล:
+                                                </label>
+                                                <input 
+                                                    type="text" 
+                                                    value={resetConfirmText}
+                                                    onChange={(e) => setResetConfirmText(e.target.value.toUpperCase())}
+                                                    placeholder="พิมพ์ RESET ที่นี่"
+                                                    className="w-full border border-gray-300 focus:border-red-500 rounded-xl px-3.5 py-2 text-sm font-mono uppercase outline-none"
+                                                />
+                                            </div>
+
+                                            <button 
+                                                onClick={handleResetCycle}
+                                                disabled={resetConfirmText !== 'RESET' || isResetting}
+                                                className={`w-full py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition ${
+                                                    resetConfirmText === 'RESET' && !isResetting
+                                                        ? 'bg-red-600 hover:bg-red-700 text-white shadow-sm' 
+                                                        : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                                                }`}
+                                            >
+                                                {isResetting ? (
+                                                    <span><i className="fas fa-spinner fa-spin mr-1"></i> กำลังล้างข้อมูลบน Cloud...</span>
+                                                ) : (
+                                                    <span><i className="fas fa-trash-restore mr-1"></i> ยืนยันล้างข้อมูลและเริ่มรอบใหม่</span>
+                                                )}
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="p-4 border-t bg-white flex justify-end gap-2">
+                                    <button onClick={() => setIsSettingsOpen(false)} className="px-5 py-2 rounded-xl text-gray-600 hover:bg-gray-100 text-sm font-semibold">ปิดหน้าต่าง</button>
+                                    {settingsTab === 'schedule' && (
+                                        <button onClick={saveSettings} className="px-6 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-xl text-sm font-bold shadow-sm">
+                                            บันทึกการตั้งค่า
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Modal กล้องถ่ายรูป */}
+                    {isCameraOpen && (
+                        <div className="fixed inset-0 bg-black z-50 flex flex-col">
+                            <div className="p-4 bg-gray-900 text-white flex justify-between items-center">
+                                <h2 className="font-bold text-sm sm:text-base">ถ่ายรูปส่งงาน - โซน {activeZone?.id}</h2>
+                                <button onClick={closeCamera} disabled={isUploading} className="w-8 h-8 rounded-full hover:bg-gray-800 flex items-center justify-center">
+                                    <i className="fas fa-times"></i>
+                                </button>
+                            </div>
+
+                            <div className="flex-1 relative flex flex-col items-center justify-center bg-black overflow-hidden">
+                                <video ref={videoRef} autoPlay playsInline className={`absolute inset-0 w-full h-full object-cover ${cameraReady ? 'opacity-100' : 'opacity-0'}`}></video>
+
+                                {!cameraReady && (
+                                    <div className="z-10 text-center p-6">
+                                        <p className="text-gray-400 text-sm mb-4">กดปุ่มด้านล่างเพื่อเปิดกล้องถ่ายรูปหน้างาน</p>
+                                        <button 
+                                            onClick={() => fileInputRef.current?.click()} 
+                                            disabled={isCompressing}
+                                            className="px-6 py-3 bg-blue-600 text-white rounded-xl font-bold text-sm shadow-lg"
+                                        >
+                                            {isCompressing ? (
+                                                <span><i className="fas fa-spinner fa-spin mr-2"></i>กำลังย่อขนาดรูป...</span>
+                                            ) : (
+                                                <span><i className="fas fa-camera mr-2"></i>เปิดกล้องถ่ายภาพ</span>
+                                            )}
+                                        </button>
+                                    </div>
+                                )}
+
+                                <input 
+                                    ref={fileInputRef}
+                                    type="file" 
+                                    accept="image/*" 
+                                    capture="environment" 
+                                    multiple 
+                                    onChange={handleNativeCapture}
+                                    className="hidden" 
+                                />
+
+                                {cameraReady && (
+                                    <div className="absolute bottom-6 flex items-center gap-6 z-10">
+                                        <button 
+                                            onClick={takePhoto} 
+                                            disabled={isUploading || isCompressing}
+                                            className="w-16 h-16 bg-white/30 border-4 border-white rounded-full flex items-center justify-center active:scale-95 transition shadow-lg"
+                                        >
+                                            <div className="w-12 h-12 bg-white rounded-full"></div>
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="bg-gray-900 border-t border-gray-800 p-4">
+                                <div className="flex items-center justify-between mb-2">
+                                    <span className="text-xs text-gray-400">
+                                        รูปที่ถ่ายแล้ว ({tempPhotos.length} รูป)
+                                        {tempPhotos.length > 0 && (
+                                            <span className="ml-1.5 text-emerald-400">
+                                                • รวม {tempPhotos.reduce((s, p) => s + p.sizeKB, 0)} KB
+                                            </span>
+                                        )}
+                                    </span>
+                                    {cameraReady && !isUploading && (
+                                        <button onClick={() => fileInputRef.current?.click()} className="text-xs text-blue-400 hover:underline">
+                                            + ถ่ายผ่านกล้องมือถือ
+                                        </button>
+                                    )}
+                                </div>
+                                <div className="flex gap-2.5 overflow-x-auto pb-3 h-24 items-center">
+                                    {tempPhotos.length === 0 ? (
+                                        <p className="text-gray-600 text-xs w-full text-center">
+                                            {isCompressing ? 'กำลังประมวลผลรูปภาพ...' : 'ยังไม่มีรูปถ่าย (ถ่ายได้หลายรูป)'}
+                                        </p>
+                                    ) : (
+                                        tempPhotos.map((p, i) => (
+                                            <div key={i} className="relative shrink-0 w-20 h-20 rounded-lg overflow-hidden border border-gray-600">
+                                                <img src={p.previewUrl} className="w-full h-full object-cover" />
+                                                <span className="absolute bottom-0.5 left-0.5 bg-black/70 text-white text-[9px] px-1 rounded">
+                                                    {p.sizeKB}KB
+                                                </span>
+                                                {!isUploading && (
+                                                    <button 
+                                                        onClick={() => removeTempPhoto(i)} 
+                                                        className="absolute top-1 right-1 bg-red-600 text-white rounded-full w-5 h-5 flex items-center justify-center text-[10px]"
+                                                    >
+                                                        <i className="fas fa-times"></i>
+                                                    </button>
+                                                )}
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+
+                                {/* แถบแสดงเปอร์เซ็นต์ความคืบหน้าขณะอัปโหลด */}
+                                {isUploading && (
+                                    <div className="w-full bg-gray-800 rounded-full h-2 mb-3 overflow-hidden">
+                                        <div 
+                                            className="bg-blue-500 h-2 transition-all duration-200" 
+                                            style={{ width: `${uploadProgress}%` }}
+                                        ></div>
+                                    </div>
+                                )}
+
+                                <button 
+                                    onClick={submitWork} 
+                                    disabled={tempPhotos.length === 0 || isUploading || isCompressing} 
+                                    className={`w-full py-3.5 rounded-xl font-bold text-sm flex justify-center items-center gap-2 transition ${tempPhotos.length > 0 && !isUploading && !isCompressing ? 'bg-blue-600 hover:bg-blue-700 text-white' : 'bg-gray-800 text-gray-500 cursor-not-allowed'}`}
+                                >
+                                    {isUploading ? (
+                                        <span><i className="fas fa-spinner fa-spin mr-1"></i> กำลังอัปโหลด ({uploadProgress}%)...</span>
+                                    ) : (
+                                        <span><i className="fas fa-paper-plane mr-1"></i> ยืนยันส่งงาน ({tempPhotos.length} รูป)</span>
+                                    )}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Modal ขยายดูรูปภาพขนาดใหญ่ */}
+                    {previewImage && (
+                        <div onClick={() => setPreviewImage(null)} className="fixed inset-0 bg-black/85 z-50 flex items-center justify-center p-4 cursor-zoom-out">
+                            <img src={previewImage} className="max-w-full max-h-full rounded-xl shadow-2xl" />
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
